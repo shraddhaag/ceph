@@ -1402,6 +1402,8 @@ SegmentCleaner::mount_ret SegmentCleaner::mount()
   const auto& sms = sm_group->get_segment_managers();
   INFO("{} segment managers", sms.size());
 
+  INFO("background_callback state={}, expected MOUNT({})",
+       (int)background_callback->get_state(), (int)state_t::MOUNT);
   assert(background_callback->get_state() == state_t::MOUNT);
   
   space_tracker.reset(
@@ -1860,6 +1862,8 @@ RBMCleaner::clean_space_ret RBMCleaner::clean_space()
 
 RBMCleaner::mount_ret RBMCleaner::mount()
 {
+  LOG_PREFIX(RBMCleaner::mount);
+  INFO("start");
   stats = {};
   register_metrics();
   return seastar::do_with(

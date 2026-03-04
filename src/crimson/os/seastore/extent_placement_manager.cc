@@ -599,18 +599,19 @@ void ExtentPlacementManager::BackgroundProcess::log_state(const char *caller) co
 
 ExtentPlacementManager::mount_ret ExtentPlacementManager::BackgroundProcess::mount() {
   LOG_PREFIX(BackgroundProcess::mount);
-  DEBUG("start");
+  INFO("start, current state={}", (int)state);
   ceph_assert(state == state_t::STOP);
   state = state_t::MOUNT;
   trimmer->reset();
   stats = {};
   register_metrics();
-  DEBUG("mounting main cleaner");
+  INFO("mounting main cleaner");
   co_await main_cleaner->mount();
   if (has_cold_tier()) {
-    DEBUG("mounting cold cleaner");
+    INFO("mounting cold cleaner");
     co_await cold_cleaner->mount();
   }
+  INFO("done");
 }
 
 void ExtentPlacementManager::BackgroundProcess::start_background()

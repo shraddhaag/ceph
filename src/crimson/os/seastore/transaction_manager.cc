@@ -107,8 +107,10 @@ TransactionManager::mount()
   LOG_PREFIX(TransactionManager::mount);
   INFO("...");
   cache->init();
+  INFO("calling epm->mount()");
   return epm->mount(
-  ).safe_then([this] {
+  ).safe_then([FNAME, this] {
+    INFO("epm->mount() done, calling journal->replay()");
     return journal->replay(
       [this](
 	const auto &offsets,
@@ -126,14 +128,16 @@ TransactionManager::mount()
 	  alloc_tail,
 	  modify_time);
       });
-  }).safe_then([this] {
+  }).safe_then([FNAME, this] {
+    INFO("journal->replay() done, calling journal->open_for_mount()");
     return journal->open_for_mount();
-  }).safe_then([this](auto start_seq) {
+  }).safe_then([FNAME, this](auto start_seq) {
+    INFO("journal->open_for_mount() done, starting scan_mapped_space");
     journal->get_trimmer().set_journal_head(start_seq);
     return with_transaction_weak(
       "mount",
       CACHE_HINT_TOUCH,
-      [this](auto &t)
+      [FNAME, this](auto &t)
     {
       return cache->init_cached_extents(t, [this](auto &t, auto &e) {
         if (is_backref_node(e->get_type())) {
@@ -141,7 +145,8 @@ TransactionManager::mount()
         } else {
           return lba_manager->init_cached_extent(t, e);
         }
-      }).si_then([this, &t] {
+      }).si_then([FNAME, this, &t] {
+        INFO("init_cached_extents done, scanning mapped space");
         epm->start_scan_space();
         if (can_drop_backref()) {
           return lba_manager->scan_mapped_space(
@@ -185,9 +190,11 @@ TransactionManager::mount()
         }
       });
     });
-  }).safe_then([this] {
+  }).safe_then([FNAME, this] {
+    INFO("scan_mapped_space done, calling epm->open_for_write()");
     return epm->open_for_write();
   }).safe_then([FNAME, this] {
+    INFO("epm->open_for_write() done, starting background");
     epm->start_background();
     cache->boot_done();
     INFO("done");

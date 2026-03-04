@@ -213,17 +213,21 @@ seastar::future<> SeaStore::start()
 #else
   bool is_test = false;
 #endif
+  INFO("is_test={}", is_test);
   using crimson::common::get_conf;
   std::string type = get_conf<std::string>("seastore_main_device_type");
   device_type_t d_type = string_to_device_type(type);
+  INFO("seastore_main_device_type={}, d_type={}", type, d_type);
   assert(d_type == device_type_t::SSD ||
          d_type == device_type_t::RANDOM_BLOCK_SSD);
 
   ceph_assert(root != "");
+  INFO("creating device from root={}", root);
   DeviceRef device_obj = co_await Device::make_device(root, d_type);
   device = std::move(device_obj);
   co_await device->start();
   ceph_assert(device);
+  INFO("device started, starting shard_stores");
   co_await shard_stores.start(root, device.get(), is_test);
   INFO("done");
 }
@@ -300,7 +304,9 @@ seastar::future<> SeaStore::Shard::mount_managers()
 {
   LOG_PREFIX(SeaStore::mount_managers);
   INFO("start");
+  INFO("calling init_managers()");
   init_managers();
+  INFO("init_managers() done, calling transaction_manager->mount()");
   return transaction_manager->mount(
   ).handle_error(
     crimson::ct_error::assert_all{
@@ -357,10 +363,15 @@ SeaStore::Shard::mkfs_managers()
 {
   LOG_PREFIX(SeaStoreS::mkfs_managers);
   INFO("...");
+  INFO("calling first init_managers()");
   init_managers();
+  INFO("first init_managers() done, calling transaction_manager->mkfs()");
   co_await transaction_manager->mkfs();
+  INFO("transaction_manager->mkfs() done, calling second init_managers()");
   init_managers();
+  INFO("second init_managers() done, calling transaction_manager->mount()");
   co_await transaction_manager->mount();
+  INFO("transaction_manager->mount() done");
   ++(shard_stats.io_num);
   ++(shard_stats.pending_io_num);
   // For TM::submit_transaction()
@@ -371,9 +382,12 @@ SeaStore::Shard::mkfs_managers()
     seastar::coroutine::lambda([&](auto &tr) -> TransactionManager::alloc_extent_iertr::future<> {
     ++(shard_stats.repeat_io_num);
     DEBUGT("...", tr);
+    INFO("calling onode_manager->mkfs()");
     co_await onode_manager->mkfs(tr);
+    INFO("calling collection_manager->mkfs()");
     auto coll_root = co_await collection_manager->mkfs(tr);
     transaction_manager->write_collection_root(tr, coll_root);
+    INFO("calling submit_transaction()");
     co_await transaction_manager->submit_transaction(tr);
   }));
   assert(shard_stats.pending_io_num);
