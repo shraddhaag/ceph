@@ -66,6 +66,9 @@ class CBT(Task):
         system_type = misc.get_system_type(self.first_mon)
 
         if system_type == 'rpm':
+            self.first_mon.run(
+                args=['sudo', 'dnf', '-y', 'install', 'epel-release']
+            )
             install_cmd = ['sudo', 'yum', '-y', 'install']
             cbt_depends = ['librbd-devel', 'pdsh', 'pdsh-rcmd-ssh','perf']
             self.log.info('Installing collectl')
