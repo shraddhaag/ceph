@@ -1,12 +1,24 @@
 import logging
 import signal
 import time
+from io import BytesIO, StringIO
 
 from gevent import sleep
 from gevent.greenlet import Greenlet
 from gevent.event import Event
 
+from teuthology.orchestra import run
+
 log = logging.getLogger(__name__)
+
+# Patterns that mark the actual crash event in a daemon log: crimson's
+# assert.cc forms, classic ceph_assert, and signal-handler output.
+_CRASH_PATTERN = (
+    r"In function '.*', ceph_assert\(|"
+    r"In function '.*', abort\(|"
+    r"FAILED ceph_assert|"
+    r"\*\*\* Caught signal"
+)
 
 class BarkError(Exception):
     """
@@ -78,8 +90,64 @@ class DaemonWatchdog(Greenlet):
     def stop(self):
         self.stopping.set()
 
+    def _extract_crash_context(self, daemon, num_context_lines=6):
+        """
+        Scrape the daemon's log for the most recent assert/abort/signal and
+        the first few following backtrace lines. Returns a single-line
+        summary (newlines collapsed to ' | ') so it fits in teuthology's
+        failure_reason field, or None on any failure.
+        """
+        try:
+            # daemon.role is cluster-prefixed (e.g. 'ceph.osd'); the on-disk
+            # log uses the bare type, e.g. /var/log/ceph/ceph-osd.0.log.
+            role_short = daemon.role.split('.')[-1]
+            log_path = '/var/log/ceph/{cluster}-{role}.{id_}.log'.format(
+                cluster=self.cluster, role=role_short, id_=daemon.id_,
+            )
+            r = daemon.remote.run(
+                args=['sudo', 'grep', '-nE', _CRASH_PATTERN, log_path,
+                      run.Raw('|'), 'tail', '-n', '1'],
+                stdout=BytesIO(),
+                stderr=StringIO(),
+                check_status=False,
+            )
+            first = r.stdout.getvalue().decode(errors='replace').strip()
+            if not first:
+                return None
+            lineno_str, _, _ = first.partition(':')
+            try:
+                lineno = int(lineno_str)
+            except ValueError:
+                return None
+            end = lineno + num_context_lines
+            r = daemon.remote.run(
+                args=['sudo', 'sed', '-n',
+                      '{a},{b}p'.format(a=lineno, b=end), log_path],
+                stdout=BytesIO(),
+                stderr=StringIO(),
+                check_status=False,
+            )
+            snippet = r.stdout.getvalue().decode(errors='replace')
+            lines = [ln.strip() for ln in snippet.splitlines() if ln.strip()]
+            if not lines:
+                return None
+            return ' | '.join(lines)
+        except Exception:
+            self.logger.exception(
+                "failed to extract crash context for %s.%s",
+                daemon.role, daemon.id_,
+            )
+            return None
+
     def bark(self, reason):
         self.log("BARK! unmounting mounts and killing all daemons")
+        # Record the bark reason as the failure_reason now, before tearing
+        # daemons down. Otherwise downstream cleanup (e.g. thrashosds calling
+        # `ceph osd dump` after we've killed the OSDs) can raise its own
+        # exception and clobber the real reason in ctx.summary.
+        if 'failure_reason' not in self.ctx.summary:
+            self.ctx.summary['failure_reason'] = reason
+            self.ctx.summary['success'] = False
         if hasattr(self.ctx, 'mounts'):
             for mount in self.ctx.mounts.values():
                 try:
@@ -139,7 +207,11 @@ class DaemonWatchdog(Greenlet):
                 self.log("daemon {name} is failed for ~{t:.0f}s".format(name=name, t=delta))
                 if delta > daemon_timeout:
                     bark = True
-                    bark_reason = f"Daemon {name} has failed"
+                    crash = self._extract_crash_context(daemon)
+                    if crash:
+                        bark_reason = f"Daemon {name} crashed: {crash}"
+                    else:
+                        bark_reason = f"Daemon {name} has failed"
                 if daemon_restart == 'normal' and daemon.proc.exitstatus == 0:
                     self.log(f"attempting to restart daemon {name}")
                     daemon.restart()
