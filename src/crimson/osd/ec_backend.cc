@@ -440,7 +440,24 @@ void ECBackend::handle_sub_write(
 {
   LOG_PREFIX(ECBackend::handle_sub_write);
   const auto tid = op.tid;
+  const auto soid = op.soid;
   DEBUGDPP("tid={} hoid={}", dpp, tid, op.soid);
+  /* NOTE: the future below is discarded. Nothing ever inspects its result,
+   * so if the store completes it exceptionally the failure is invisible: the
+   * si_then that builds ECSubWriteReply never runs, no reply is sent for this
+   * shard, RMWPipeline::Op::pending_commits never reaches zero, finish_rmw
+   * and on_all_commit never fire, and the client op stays in flight until it
+   * is reported as a slow request.
+   *
+   * ct_error::assert_all below does not close that hole. It handles the
+   * errorator's declared error types; a C++ exception thrown inside the store
+   * travels on the future's exception channel instead and passes straight
+   * through it.
+   *
+   * The handle_exception_interruptible at the end does not fix the hang
+   * either - no reply is sent either way - it only makes the cause visible
+   * rather than leaving a silently abandoned future.
+   */
   std::ignore = handle_sub_write(
     from, std::move(op), eclistener
   ).si_then([tid, &eclistener, FNAME, this] {
@@ -453,7 +470,21 @@ void ECBackend::handle_sub_write(
     reply.from = eclistener.whoami_shard();
     DEBUGDPP("tid={} reply_from={}", dpp, tid, reply.from);
     return handle_rep_write_reply(std::move(reply));
-  }, crimson::ct_error::assert_all("unexpected error"));
+  }, crimson::ct_error::assert_all("unexpected error")
+  ).handle_exception_interruptible([FNAME, tid, soid, this](auto eptr) {
+    std::string what;
+    try {
+      std::rethrow_exception(eptr);
+    } catch (const std::exception &e) {
+      what = e.what();
+    } catch (...) {
+      what = "unknown exception";
+    }
+    ERRORDPP("tid={} hoid={} sub-write raised {}; the reply for this shard "
+             "is not sent and pending_commits will never reach zero, so the "
+             "client op will hang", dpp, tid, soid, what);
+    return seastar::make_ready_future<>();
+  });
 }
 
 ECBackend::write_iertr::future<>
