@@ -1580,7 +1580,7 @@ TEST_P(seastore_test_t, clone_range)
 }
 
 /*
- * The four tests below narrow down a seastore clone_range hang observed with
+ * The tests below narrow down a seastore clone_range failure observed with
  * crimson EC pools, when a writefull shrinks an existing object.
  *
  * For such a write ECTransaction emits, per data shard, in a *single*
@@ -1607,21 +1607,43 @@ TEST_P(seastore_test_t, clone_range)
  * tests only pin down what seastore does with the resulting transaction.
  *
  * seastore_test_t.clone_range above already clones three times into one
- * destination and passes, but always at *different* offsets and always one
- * transaction per clone. Four factors separate that from the failing case:
+ * destination and passes. Four things separate it from the failing case:
  *
- *   1. the same range is cloned twice
- *   2. both clones are in one transaction
- *   3. the source is truncated down and back up between the clones
- *   4. the destination is touched (and so gets its data reservation) before
- *      the first clone
+ *   1. its destination is a snap clone, EC's is a generation object
+ *   2. it never touches the destination first
+ *   3. it uses one transaction per clone
+ *   4. it always clones a *different* range each time
  *
- * Each test adds one factor, so the first one that hangs names the trigger.
- * All four use a generation object as the destination, as EC does.
+ * The tests form a ladder from that passing baseline to the EC sequence,
+ * changing exactly one variable per rung, so the first rung that fails names
+ * the trigger:
  *
- * NOTE: a failure here is a hang, not an assertion. Until the underlying bug
- * is fixed, prefix the hanging cases with DISABLED_ before merging, or CI will
- * block rather than report.
+ *   clone_range_baseline_snap_dst          the baseline, must pass
+ *   clone_range_gen_dst                    + generation-object destination
+ *   clone_range_gen_dst_touched            + explicit touch first
+ *   clone_range_distinct_ranges_single_txn + both clones in one transaction
+ *   clone_range_repeat_separate_txn        same range twice, a txn each
+ *   clone_range_repeat_single_txn          same range twice, one transaction
+ *   clone_range_repeat_after_truncate      + the source truncated between them
+ *
+ * The last rung is the exact ECTransaction sequence.
+ *
+ * Each test prints progress to stdout, so the run is followable whatever the
+ * log level is. gtest_seastar.cc forces --default-log-level=debug unless the
+ * caller sets it or FOR_MAKE_CHECK is in the environment, so the output is
+ * heavy either way; filter it rather than fight the option parser:
+ *
+ *   ./bin/unittest-seastore --memory 256M --smp 1 \
+ *     --gtest_filter='*clone_range*' > /tmp/cr.log 2>&1
+ *   grep -nE '^\[ (RUN|  FAILED|       OK)|clone_range_[a-z_]*:' /tmp/cr.log
+ *
+ * The last "clone_range_<name>: <step>" line is how far the run got. Check
+ * ./bin/unittest-seastore --help for the log options this seastar build
+ * accepts before adding any.
+ *
+ * NOTE: a failure here may be a hang or an abort rather than an assertion.
+ * Until the underlying bug is fixed, prefix the failing cases with DISABLED_
+ * before merging, or CI will block rather than report.
  */
 
 namespace {
@@ -1642,14 +1664,80 @@ ghobject_t make_gen_oid(int i, gen_t gen) {
 
 }
 
-// Control. Two clones into one destination in one transaction, but at
-// different offsets - the shape the existing clone_range test covers, moved
-// into a single transaction. Expected to pass. If this hangs, the trigger is
-// simply "more than one clone per transaction" and factors 1 and 3 are
-// irrelevant.
+// Rung 1, the baseline. Snap-clone destination, no touch, one transaction per
+// clone, different ranges - the same shape as seastore_test_t.clone_range
+// above. This must pass; if it does not, the harness or the environment is at
+// fault and nothing below it means anything.
+TEST_P(seastore_test_t, clone_range_baseline_snap_dst)
+{
+  run_async([this] {
+    std::cout << "clone_range_baseline_snap_dst: start" << std::endl;
+    auto &src = get_object(make_oid(0));
+    src.write(*sharded_seastore, 0, 8192, 'a');
+
+    auto dst = src.get_clone(20);
+
+    dst.clone_range(*sharded_seastore, src, 0, 4096, 0);
+    std::cout << "clone_range_baseline_snap_dst: clone 1 done" << std::endl;
+    dst.clone_range(*sharded_seastore, src, 4096, 4096, 4096);
+    std::cout << "clone_range_baseline_snap_dst: clone 2 done" << std::endl;
+
+    dst.read(*sharded_seastore, 0, 8192);
+    std::cout << "clone_range_baseline_snap_dst: read done" << std::endl;
+  });
+}
+
+// Rung 2. Only change from the baseline: the destination is a generation
+// object, as EC's rollback object is, rather than a snap clone.
+TEST_P(seastore_test_t, clone_range_gen_dst)
+{
+  run_async([this] {
+    std::cout << "clone_range_gen_dst: start" << std::endl;
+    auto &src = get_object(make_oid(0));
+    src.write(*sharded_seastore, 0, 8192, 'a');
+
+    auto &dst = get_object(make_gen_oid(0, 2));
+
+    dst.clone_range(*sharded_seastore, src, 0, 4096, 0);
+    std::cout << "clone_range_gen_dst: clone 1 done" << std::endl;
+    dst.clone_range(*sharded_seastore, src, 4096, 4096, 4096);
+    std::cout << "clone_range_gen_dst: clone 2 done" << std::endl;
+
+    dst.read(*sharded_seastore, 0, 8192);
+    std::cout << "clone_range_gen_dst: read done" << std::endl;
+  });
+}
+
+// Rung 3. Only change from rung 2: the destination is touched first, so it
+// gets its data reservation before the first clone rather than during it.
+TEST_P(seastore_test_t, clone_range_gen_dst_touched)
+{
+  run_async([this] {
+    std::cout << "clone_range_gen_dst_touched: start" << std::endl;
+    auto &src = get_object(make_oid(0));
+    src.write(*sharded_seastore, 0, 8192, 'a');
+
+    auto &dst = get_object(make_gen_oid(0, 2));
+    dst.touch(*sharded_seastore);
+    std::cout << "clone_range_gen_dst_touched: touch done" << std::endl;
+
+    dst.clone_range(*sharded_seastore, src, 0, 4096, 0);
+    std::cout << "clone_range_gen_dst_touched: clone 1 done" << std::endl;
+    dst.clone_range(*sharded_seastore, src, 4096, 4096, 4096);
+    std::cout << "clone_range_gen_dst_touched: clone 2 done" << std::endl;
+
+    dst.read(*sharded_seastore, 0, 8192);
+    std::cout << "clone_range_gen_dst_touched: read done" << std::endl;
+  });
+}
+
+// Rung 4. Only change from rung 3: both clones share one transaction, so the
+// second sees the first clone's mapping while it is still pending. The ranges
+// are still distinct.
 TEST_P(seastore_test_t, clone_range_distinct_ranges_single_txn)
 {
   run_async([this] {
+    std::cout << "clone_range_distinct_ranges_single_txn: start" << std::endl;
     auto &src = get_object(make_oid(0));
     src.write(*sharded_seastore, 0, 8192, 'a');
 
@@ -1660,8 +1748,10 @@ TEST_P(seastore_test_t, clone_range_distinct_ranges_single_txn)
     dst.clone_range(*sharded_seastore, t, src, 0, 4096, 0);
     dst.clone_range(*sharded_seastore, t, src, 4096, 4096, 4096);
     do_transaction(std::move(t));
+    std::cout << "clone_range_distinct_ranges_single_txn: txn done" << std::endl;
 
     dst.read(*sharded_seastore, 0, 8192);
+    std::cout << "clone_range_distinct_ranges_single_txn: read done" << std::endl;
   });
 }
 
@@ -1670,6 +1760,7 @@ TEST_P(seastore_test_t, clone_range_distinct_ranges_single_txn)
 TEST_P(seastore_test_t, clone_range_repeat_separate_txn)
 {
   run_async([this] {
+    std::cout << "clone_range_repeat_separate_txn: start" << std::endl;
     auto &src = get_object(make_oid(0));
     src.write(*sharded_seastore, 0, 4096, 'a');
 
@@ -1677,9 +1768,12 @@ TEST_P(seastore_test_t, clone_range_repeat_separate_txn)
 
     dst.touch(*sharded_seastore);
     dst.clone_range(*sharded_seastore, src, 0, 4096, 0);
+    std::cout << "clone_range_repeat_separate_txn: clone 1 done" << std::endl;
     dst.clone_range(*sharded_seastore, src, 0, 4096, 0);
+    std::cout << "clone_range_repeat_separate_txn: clone 2 done" << std::endl;
 
     dst.read(*sharded_seastore, 0, 4096);
+    std::cout << "clone_range_repeat_separate_txn: read done" << std::endl;
   });
 }
 
@@ -1689,6 +1783,7 @@ TEST_P(seastore_test_t, clone_range_repeat_separate_txn)
 TEST_P(seastore_test_t, clone_range_repeat_single_txn)
 {
   run_async([this] {
+    std::cout << "clone_range_repeat_single_txn: start" << std::endl;
     auto &src = get_object(make_oid(0));
     src.write(*sharded_seastore, 0, 4096, 'a');
 
@@ -1700,8 +1795,10 @@ TEST_P(seastore_test_t, clone_range_repeat_single_txn)
     dst.touch(t);
     dst.clone_range(*sharded_seastore, t, src, 0, 4096, 0);
     do_transaction(std::move(t));
+    std::cout << "clone_range_repeat_single_txn: txn done" << std::endl;
 
     dst.read(*sharded_seastore, 0, 4096);
+    std::cout << "clone_range_repeat_single_txn: read done" << std::endl;
   });
 }
 
@@ -1717,6 +1814,7 @@ TEST_P(seastore_test_t, clone_range_repeat_single_txn)
 TEST_P(seastore_test_t, clone_range_repeat_after_truncate)
 {
   run_async([this] {
+    std::cout << "clone_range_repeat_after_truncate: start" << std::endl;
     auto &src = get_object(make_oid(0));
     src.write(*sharded_seastore, 0, 4096, 'a');
 
@@ -1737,10 +1835,12 @@ TEST_P(seastore_test_t, clone_range_repeat_after_truncate)
     t.clone_range(coll_name, src.oid, dst.oid, 0, 4096, 0);
     src.write(*sharded_seastore, t, 0, new_data);
     do_transaction(std::move(t));
+    std::cout << "clone_range_repeat_after_truncate: txn done" << std::endl;
 
     // The source ends up holding the newly written data. The truncates cancel
     // out and the write covers the whole object, so src.contents is accurate.
     src.read(*sharded_seastore, 0, 4096);
+    std::cout << "clone_range_repeat_after_truncate: src read done" << std::endl;
 
     // dst is EC's rollback object. The first clone saved the original 4096
     // bytes; the second copied the truncated and zero-extended source over
@@ -1755,6 +1855,7 @@ TEST_P(seastore_test_t, clone_range_repeat_after_truncate)
     auto dst_ret = sharded_seastore->read(coll, dst.oid, 0, 4096).unsafe_get();
     EXPECT_EQ(dst_ret.length(), 4096u);
     EXPECT_EQ(dst_ret, expected);
+    std::cout << "clone_range_repeat_after_truncate: dst read done" << std::endl;
   });
 }
 
