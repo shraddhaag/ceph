@@ -396,6 +396,7 @@ ObjectDataHandler::clone_ret do_clonerange(
   }
   // clone the src mappings
   co_await overwrite_range.clonerange_info->refresh();
+  DEBUGT("refreshed, collecting src mappings ...", ctx.t);
   auto src = overwrite_range.clonerange_info->first_src_mapping;
   auto offset = overwrite_range.clonerange_info->offset;
   auto len = overwrite_range.clonerange_info->len;
@@ -411,9 +412,13 @@ ObjectDataHandler::clone_ret do_clonerange(
     // case
     src = co_await src.next();
   }
+  DEBUGT("calling tm.clone_range src_base={} dest_base={} 0x{:x}~0x{:x} ...",
+         ctx.t, src_base, dest_base, aligned_off, aligned_len);
   auto cr_ret = co_await ctx.tm.clone_range(
     ctx.t, src_base, dest_base, aligned_off, aligned_len,
     std::move(write_pos), std::move(src), true);
+  DEBUGT("tm.clone_range returned, shared_direct_mapping={}",
+         ctx.t, cr_ret.shared_direct_mapping);
   if (cr_ret.shared_direct_mapping) {
     ctx.onode.set_need_cow(ctx.t);
   }
@@ -441,6 +446,7 @@ ObjectDataHandler::clone_ret do_clonerange(
     auto iter = data.tailbl->cbegin();
     iter.copy(extent->get_length(), extent->get_bptr().c_str());
   }
+  DEBUGT("done", ctx.t);
 }
 
 
@@ -1028,11 +1034,15 @@ ObjectDataHandler::handle_single_mapping_overwrite(
   LBAMapping mapping,
   op_type_t op_type)
 {
+  LOG_PREFIX(ObjectDataHandler::handle_single_mapping_overwrite);
   auto ehpolicy = get_edge_handle_policy(
     mapping,
     overwrite_range.aligned_begin,
     overwrite_range.aligned_len,
     op_type);
+  // ehpolicy: 0=DELTA_BASED_PUNCH 1=MERGE_INPLACE 2=REMAP
+  DEBUGT("mapping {} ehpolicy={} ...",
+         ctx.t, mapping, static_cast<unsigned>(ehpolicy));
   auto do_overwrite = [ctx, &overwrite_range, &data, op_type](auto pos) {
     if (overwrite_range.is_empty()) {
       // the overwrite is completed in the previous steps,
@@ -1119,9 +1129,12 @@ ObjectDataHandler::handle_multi_mapping_overwrite(
   LBAMapping first_mapping,
   op_type_t op_type)
 {
+  LOG_PREFIX(ObjectDataHandler::handle_multi_mapping_overwrite);
+  DEBUGT("first_mapping {} punching hole ...", ctx.t, first_mapping);
   return punch_multi_mapping_hole(
     ctx, overwrite_range, data, std::move(first_mapping), op_type
-  ).si_then([ctx, &overwrite_range, &data, op_type](auto pos) {
+  ).si_then([ctx, &overwrite_range, &data, op_type, FNAME](auto pos) {
+    DEBUGT("hole punched, pos={}", ctx.t, pos);
     if (overwrite_range.is_empty()) {
       // the overwrite is completed in the previous steps,
       // this can happen if delta based overwrites are involved.
@@ -1303,27 +1316,33 @@ ObjectDataHandler::clone_ret ObjectDataHandler::clone_range(
   ceph_assert(srcoff == destoff);
   return with_objects_data(
     ctx,
-    [ctx, this, srcoff, len](auto &object_data, auto &d_object_data)
+    [ctx, this, srcoff, len, FNAME](auto &object_data, auto &d_object_data)
     -> clone_ret {
     ceph_assert(!object_data.is_null());
     data_t data;
     auto dest_mapping = co_await prepare_data_reservation(
       ctx, *ctx.d_onode, d_object_data, object_data.get_reserved_data_len());
+    DEBUGT("dest reservation done, reserved_here={}",
+           ctx.t, dest_mapping.has_value());
     if (!dest_mapping) {
       auto d_base = d_object_data.get_reserved_data_base();
       auto laddr = (d_base + srcoff).get_aligned_laddr(
 	ctx.tm.get_block_size());
+      DEBUGT("looking up dest pin at {} ...", ctx.t, laddr);
       dest_mapping = co_await ctx.tm.get_containing_pin(ctx.t, laddr
       ).handle_error_interruptible(
 	clone_iertr::pass_further{},
 	crimson::ct_error::assert_all("unexpected enoent")
       );
     }
+    DEBUGT("dest mapping {}", ctx.t, *dest_mapping);
     // For unaligned range cloning, we need to read data.head_padding
     // and data.tail_padding from the src range, and later write into
     // the dest range with data.headbl and data.tailbl.
     co_await read_edge_for_clone_range(
       ctx, object_data, srcoff, len, data);
+    DEBUGT("read_edge_for_clone_range done, srcoff=0x{:x} len=0x{:x}",
+           ctx.t, srcoff, len);
     auto base = object_data.get_reserved_data_base();
     auto begin = base + srcoff;
     auto block_size = ctx.tm.get_block_size();
@@ -1333,6 +1352,7 @@ ObjectDataHandler::clone_ret ObjectDataHandler::clone_range(
       clone_iertr::pass_further{},
       crimson::ct_error::assert_all("unexpected enoent")
     );
+    DEBUGT("src mapping {}", ctx.t, src_mapping);
     auto d_base = d_object_data.get_reserved_data_base();
     auto unaligned_begin = d_base + srcoff;
     auto unaligned_end = unaligned_begin + len;
@@ -1342,6 +1362,9 @@ ObjectDataHandler::clone_ret ObjectDataHandler::clone_range(
       unaligned_end,
       ctx.tm.get_block_size(),
       clone_range_t{std::move(src_mapping), base, d_base, srcoff, len}};
+    DEBUGT("dispatching overwrite {} single={} ...",
+           ctx.t, overwrite_range,
+           overwrite_range.is_range_in_mapping(*dest_mapping));
     if (overwrite_range.is_range_in_mapping(*dest_mapping)) {
       co_await handle_single_mapping_overwrite(
 	ctx, overwrite_range, data, std::move(*dest_mapping),
@@ -1351,6 +1374,7 @@ ObjectDataHandler::clone_ret ObjectDataHandler::clone_range(
 	ctx, overwrite_range, data, std::move(*dest_mapping),
 	op_type_t::OP_CLONERANGE);
     }
+    DEBUGT("done, srcoff=0x{:x} len=0x{:x}", ctx.t, srcoff, len);
   });
 }
 
