@@ -1579,6 +1579,185 @@ TEST_P(seastore_test_t, clone_range)
   });
 }
 
+/*
+ * The four tests below narrow down a seastore clone_range hang observed with
+ * crimson EC pools, when a writefull shrinks an existing object.
+ *
+ * For such a write ECTransaction emits, per data shard, in a *single*
+ * ObjectStore::Transaction:
+ *
+ *   op 0  touch        <oid>#<gen>
+ *   op 1  clonerange2  <oid># -> <oid>#<gen>, 0~4096
+ *   op 2  truncate     <oid>#, 64                  (the new object size)
+ *   op 3  truncate     <oid>#, 4096                (back up to the aligned
+ *                                                   shard size EC guarantees;
+ *                                                   bytes 64..4095 become zero)
+ *   op 4  touch        <oid>#<gen>                 (duplicate of op 0)
+ *   op 5  clonerange2  <oid># -> <oid>#<gen>, 0~4096  (duplicate of op 1)
+ *   op 6  write        <oid>#, 0~4096
+ *   op 7  setattrs
+ *
+ * seastore executes through op 5 and never returns from it. op 6 never runs,
+ * the transaction never commits, and the client op hangs as a slow request.
+ *
+ * Ops 4 and 5 are emitted because ECTransaction has two independent clone
+ * sites - Generate::truncate() and Generate::appends_and_clone_ranges() - and
+ * the "only touch once" set in the second is function-local, so it cannot see
+ * what the first already did. That duplication is a separate EC bug; these
+ * tests only pin down what seastore does with the resulting transaction.
+ *
+ * seastore_test_t.clone_range above already clones three times into one
+ * destination and passes, but always at *different* offsets and always one
+ * transaction per clone. Four factors separate that from the failing case:
+ *
+ *   1. the same range is cloned twice
+ *   2. both clones are in one transaction
+ *   3. the source is truncated down and back up between the clones
+ *   4. the destination is touched (and so gets its data reservation) before
+ *      the first clone
+ *
+ * Each test adds one factor, so the first one that hangs names the trigger.
+ * All four use a generation object as the destination, as EC does.
+ *
+ * NOTE: a failure here is a hang, not an assertion. Until the underlying bug
+ * is fixed, prefix the hanging cases with DISABLED_ before merging, or CI will
+ * block rather than report.
+ */
+
+namespace {
+
+bufferlist make_filled_bl(size_t len, char fill) {
+  auto bp = bufferptr(buffer::create(len));
+  ::memset(bp.c_str(), fill, len);
+  bufferlist bl;
+  bl.append(bp);
+  return bl;
+}
+
+ghobject_t make_gen_oid(int i, gen_t gen) {
+  auto ret = make_oid(i);
+  ret.generation = gen;
+  return ret;
+}
+
+}
+
+// Control. Two clones into one destination in one transaction, but at
+// different offsets - the shape the existing clone_range test covers, moved
+// into a single transaction. Expected to pass. If this hangs, the trigger is
+// simply "more than one clone per transaction" and factors 1 and 3 are
+// irrelevant.
+TEST_P(seastore_test_t, clone_range_distinct_ranges_single_txn)
+{
+  run_async([this] {
+    auto &src = get_object(make_oid(0));
+    src.write(*sharded_seastore, 0, 8192, 'a');
+
+    auto &dst = get_object(make_gen_oid(0, 2));
+
+    CTransaction t;
+    dst.touch(t);
+    dst.clone_range(*sharded_seastore, t, src, 0, 4096, 0);
+    dst.clone_range(*sharded_seastore, t, src, 4096, 4096, 4096);
+    do_transaction(std::move(t));
+
+    dst.read(*sharded_seastore, 0, 8192);
+  });
+}
+
+// Factor 1 (+4): the same range cloned twice, but one transaction per clone,
+// so the first clone's mapping is committed before the second runs.
+TEST_P(seastore_test_t, clone_range_repeat_separate_txn)
+{
+  run_async([this] {
+    auto &src = get_object(make_oid(0));
+    src.write(*sharded_seastore, 0, 4096, 'a');
+
+    auto &dst = get_object(make_gen_oid(0, 2));
+
+    dst.touch(*sharded_seastore);
+    dst.clone_range(*sharded_seastore, src, 0, 4096, 0);
+    dst.clone_range(*sharded_seastore, src, 0, 4096, 0);
+
+    dst.read(*sharded_seastore, 0, 4096);
+  });
+}
+
+// Factors 1 + 2 + 4: the same range cloned twice in one transaction, so the
+// second clone sees the first clone's mapping while it is still pending.
+// The source is untouched between them, so the two clones copy identical data.
+TEST_P(seastore_test_t, clone_range_repeat_single_txn)
+{
+  run_async([this] {
+    auto &src = get_object(make_oid(0));
+    src.write(*sharded_seastore, 0, 4096, 'a');
+
+    auto &dst = get_object(make_gen_oid(0, 2));
+
+    CTransaction t;
+    dst.touch(t);
+    dst.clone_range(*sharded_seastore, t, src, 0, 4096, 0);
+    dst.touch(t);
+    dst.clone_range(*sharded_seastore, t, src, 0, 4096, 0);
+    do_transaction(std::move(t));
+
+    dst.read(*sharded_seastore, 0, 4096);
+  });
+}
+
+// All four factors: the exact op sequence ECTransaction produces. This is the
+// case observed to hang at the second clone_range.
+//
+// The read assertions also document the second half of the EC bug. The first
+// clone saves the original 4096 bytes. Ops 2 and 3 then truncate the source to
+// 64 and extend it back to 4096, zeroing bytes 64..4095. The second clone
+// copies that over the saved copy, so the destination - which is EC's rollback
+// object - keeps only the first 64 bytes of the original data. A rollback from
+// it would restore zeros for the rest.
+TEST_P(seastore_test_t, clone_range_repeat_after_truncate)
+{
+  run_async([this] {
+    auto &src = get_object(make_oid(0));
+    src.write(*sharded_seastore, 0, 4096, 'a');
+
+    auto &dst = get_object(make_gen_oid(0, 2));
+    auto new_data = make_filled_bl(4096, 'b');
+
+    CTransaction t;
+    dst.touch(t);
+    dst.clone_range(*sharded_seastore, t, src, 0, 4096, 0);
+    src.truncate(t, 64);
+    src.truncate(t, 4096);
+    dst.touch(t);
+    // Raw clone_range here rather than the object_state_t helper: the helper
+    // models the destination by reading the source at build time, but the two
+    // truncates above only take effect when the transaction is submitted. It
+    // would record 4096 bytes of 'a' where the store will hold 64 bytes of 'a'
+    // followed by zeros. dst.contents is stale from this point on.
+    t.clone_range(coll_name, src.oid, dst.oid, 0, 4096, 0);
+    src.write(*sharded_seastore, t, 0, new_data);
+    do_transaction(std::move(t));
+
+    // The source ends up holding the newly written data. The truncates cancel
+    // out and the write covers the whole object, so src.contents is accurate.
+    src.read(*sharded_seastore, 0, 4096);
+
+    // dst is EC's rollback object. The first clone saved the original 4096
+    // bytes; the second copied the truncated and zero-extended source over
+    // them, so everything past the truncate point is lost.
+    bufferlist expected;
+    {
+      auto bp = bufferptr(buffer::create(4096));
+      ::memset(bp.c_str(), 0, 4096);
+      ::memset(bp.c_str(), 'a', 64);
+      expected.append(bp);
+    }
+    auto dst_ret = sharded_seastore->read(coll, dst.oid, 0, 4096).unsafe_get();
+    EXPECT_EQ(dst_ret.length(), 4096u);
+    EXPECT_EQ(dst_ret, expected);
+  });
+}
+
 TEST_P(seastore_test_t, zero)
 {
   run_async([this] {
