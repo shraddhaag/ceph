@@ -1618,8 +1618,10 @@ TEST_P(seastore_test_t, clone_range)
  * changing exactly one variable per rung, so the first rung that fails names
  * the trigger:
  *
- *   clone_range_baseline_snap_dst          the baseline, must pass
- *   clone_range_gen_dst                    + generation-object destination
+ *   clone_range_baseline_snap_dst          the baseline, passes
+ *   clone_range_plain_dst                  + ordinary head destination
+ *   clone_range_gen_dst_distinct_hobj      + generation dst, other hobject_t
+ *   clone_range_gen_dst                    + generation dst, same hobject_t
  *   clone_range_gen_dst_touched            + explicit touch first
  *   clone_range_distinct_ranges_single_txn + both clones in one transaction
  *   clone_range_repeat_separate_txn        same range twice, a txn each
@@ -1627,6 +1629,12 @@ TEST_P(seastore_test_t, clone_range)
  *   clone_range_repeat_after_truncate      + the source truncated between them
  *
  * The last rung is the exact ECTransaction sequence.
+ *
+ * Measured so far: rung 1 passes, clone_range_gen_dst aborts during the read
+ * on ceph_assert(!is_reserved_ptr(child)) at linked_tree_node.h:370, after
+ * both clones report done. So the transaction batching, the repeated range
+ * and the touch are all eliminated - none is needed to reproduce. See the
+ * comment on clone_range_plain_dst for what the laddrs say about why.
  *
  * Each test prints progress to stdout, so the run is followable whatever the
  * log level is. gtest_seastar.cc forces --default-log-level=debug unless the
@@ -1687,8 +1695,83 @@ TEST_P(seastore_test_t, clone_range_baseline_snap_dst)
   });
 }
 
-// Rung 2. Only change from the baseline: the destination is a generation
-// object, as EC's rollback object is, rather than a snap clone.
+// Rung 1b, the deciding rung. Destination is an ordinary second head object -
+// no snap, no generation, a different hobject_t, its own object id.
+//
+// What separates the passing rung 1 from the aborting rung 2 is not the
+// generation and not the hobject_t, but the destination's local_clone_id.
+// laddr_t prints as (shard, pool, reversed_hash, local_object_id,
+// local_clone_id, is_metadata, offset) - seastore_types.cc:131-150. From the
+// failing run:
+//
+//   snap dst  (passes) L0x...(-1,0,0,2a413d5,280ee9,0,0)  clone_id non-zero
+//   gen  dst  (aborts) L0x...(-1,0,0,15b4e50,     0,0,0)  clone_id zero
+//   src       (both)   L0x...(-1,0,0,20f5135,     0,0,0)  clone_id zero
+//
+// That matters because BtreeLBAManager::move_and_clone_direct_mapping stores
+// the destination's clone id as the indirect target:
+//
+//   val.pladdr = ret.dest->get_key().get_local_clone_id();
+//
+// and then poisons the source's btree child slot with reset_child_ptr. With a
+// zero clone id the indirect mapping is degenerate, which is why the later
+// read both fails to format it (bad_variant_access in
+// resolve_cursor_to_mapping) and walks into the poisoned slot
+// (ceph_assert(!is_reserved_ptr(child)) at linked_tree_node.h:370).
+//
+// A plain head destination also has clone_id zero, so:
+//
+//   aborts -> clone_range requires a snap-clone destination; generations are
+//             irrelevant and any touch-created destination is affected
+//   passes -> something specific to generation objects after all
+TEST_P(seastore_test_t, clone_range_plain_dst)
+{
+  run_async([this] {
+    std::cout << "clone_range_plain_dst: start" << std::endl;
+    auto &src = get_object(make_oid(0));
+    src.write(*sharded_seastore, 0, 8192, 'a');
+
+    auto &dst = get_object(make_oid(1));
+
+    dst.clone_range(*sharded_seastore, src, 0, 4096, 0);
+    std::cout << "clone_range_plain_dst: clone 1 done" << std::endl;
+    dst.clone_range(*sharded_seastore, src, 4096, 4096, 4096);
+    std::cout << "clone_range_plain_dst: clone 2 done" << std::endl;
+
+    dst.read(*sharded_seastore, 0, 8192);
+    std::cout << "clone_range_plain_dst: read done" << std::endl;
+  });
+}
+
+// Rung 1c. Generation-object destination of a *different* hobject_t than the
+// source, to confirm the shared hobject_t is not the trigger. Onode carries
+// only a hobject_t (onode.h:114-118), so in rung 2 both onodes print the same
+// hobj even though they are distinct objects - but they still get distinct
+// local_object_ids, so the shared hobj is a red herring. This rung records
+// that.
+TEST_P(seastore_test_t, clone_range_gen_dst_distinct_hobj)
+{
+  run_async([this] {
+    std::cout << "clone_range_gen_dst_distinct_hobj: start" << std::endl;
+    auto &src = get_object(make_oid(0));
+    src.write(*sharded_seastore, 0, 8192, 'a');
+
+    auto &dst = get_object(make_gen_oid(1, 2));
+
+    dst.clone_range(*sharded_seastore, src, 0, 4096, 0);
+    std::cout << "clone_range_gen_dst_distinct_hobj: clone 1 done" << std::endl;
+    dst.clone_range(*sharded_seastore, src, 4096, 4096, 4096);
+    std::cout << "clone_range_gen_dst_distinct_hobj: clone 2 done" << std::endl;
+
+    dst.read(*sharded_seastore, 0, 8192);
+    std::cout << "clone_range_gen_dst_distinct_hobj: read done" << std::endl;
+  });
+}
+
+// Rung 2. Generation-object destination sharing the source's hobject_t, as
+// EC's rollback object does. Observed to abort during the read on
+// ceph_assert(!is_reserved_ptr(child)) at linked_tree_node.h:370, after both
+// clones report done.
 TEST_P(seastore_test_t, clone_range_gen_dst)
 {
   run_async([this] {
