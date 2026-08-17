@@ -1579,6 +1579,70 @@ TEST_P(seastore_test_t, clone_range)
   });
 }
 
+/*
+ * clone_range cannot address a destination in a different object.
+ *
+ * An indirect LBA mapping stores only a local_clone_id, and the target laddr
+ * is reconstructed from the mapping's *own* laddr with that one field
+ * swapped:
+ *
+ *   laddr_t build_laddr(laddr_t key) const {           // seastore_types.h
+ *     return key.with_local_clone_id(get_local_clone_id());
+ *   }
+ *   laddr_t get_intermediate_key() const {             // lba_btree_node.h
+ *     return iter.get_val().pladdr.build_laddr(key);
+ *   }
+ *
+ * Shard, pool, reversed_hash, local_object_id and offset all come from the
+ * destination, so the encoding can only ever say "another clone of this same
+ * object". When source and destination are different objects the
+ * reconstruction lands on the destination itself and the mapping points at
+ * itself.
+ *
+ * seastore_test_t.clone_range above passes only because every destination in
+ * it is a snap clone of the source - same local_object_id, different
+ * local_clone_id - which is the one shape the encoding can represent.
+ */
+
+// The shape ECTransaction emits, in miniature: the same range cloned twice
+// into the same destination. EC does this because it has two independent
+// clone sites - Generate::truncate() and Generate::appends_and_clone_ranges()
+// - whose touched-set is function-local, so the second cannot see that the
+// first already cloned the range.
+//
+// The first clone succeeds. The second has to overwrite the mapping the first
+// left behind, and touching it throws std::bad_variant_access out of
+// TransactionManager::resolve_cursor_to_mapping.
+//
+// This is EC's op 5. In the OSD the throw is invisible: ECBackend's
+// handle_sub_write discards the transaction future with std::ignore, and
+// ct_error::assert_all cannot intercept a C++ exception, so the continuation
+// that sends ECSubWriteReply never runs, pending_commits never reaches zero,
+// and the client op hangs as a slow request. Here the abandoned future breaks
+// the test harness's promise instead, and gtest reports it.
+//
+// No read is needed - the second clone is where it throws.
+TEST_P(seastore_test_t, clone_range_cross_object_same_range_twice)
+{
+  run_async([this] {
+    std::cout << "clone_range_cross_object_same_range_twice: start" << std::endl;
+    auto &src = get_object(make_oid(0));
+    src.write(*sharded_seastore, 0, 4096, 'a');
+
+    auto &dst = get_object(make_oid(1));
+
+    // EC op 1
+    dst.clone_range(*sharded_seastore, src, 0, 4096, 0);
+    std::cout << "clone_range_cross_object_same_range_twice: clone 1 done"
+              << std::endl;
+
+    // EC op 5 - same source range, same destination range
+    dst.clone_range(*sharded_seastore, src, 0, 4096, 0);
+    std::cout << "clone_range_cross_object_same_range_twice: clone 2 done"
+              << std::endl;
+  });
+}
+
 TEST_P(seastore_test_t, zero)
 {
   run_async([this] {
