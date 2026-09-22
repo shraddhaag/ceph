@@ -813,6 +813,79 @@ TEST_P(TestBackendBasics, TruncateToChunkSizeAndWriteToSameSize) {
   }
 }
 
+// Reproducer for https://tracker.ceph.com/issues/79531
+//
+// An EC op that shrinks an object and writes over the shrunk range makes two
+// clones into the same rollback object:
+//
+//   ECTransaction::Generate::truncate()                 clones, then truncates
+//   ECTransaction::Generate::appends_and_clone_ranges() clones again
+//
+// The second clone reads a source that the first one's truncate already
+// changed, thus it copies the truncated object over the saved original. The
+// guard in appends_and_clone_ranges() compares chunk-aligned sizes, so a
+// shrink that stays inside one chunk gets through it.
+//
+// The test does not roll back. It reads the rollback object directly: if it
+// does not hold the object as it was before the op, a rollback gives wrong
+// data.
+TEST_P(TestBackendBasics, TruncateWithinChunkAndWriteRollbackClone) {
+  const auto& param = GetParam().write_read;
+  const auto& backend_config = GetParam().backend;
+
+  if (backend_config.pool_type != EC) {
+    GTEST_SKIP() << "rollback clones only exist for EC backends";
+  }
+
+  std::string obj_name =
+    "test_rollback_clone_" + backend_config.label + "_" + param.label;
+
+  // Reads shard 0 of the object, generation gen. NO_GEN is the object itself,
+  // any other generation is the rollback clone of that version.
+  auto read_shard_0 = [&](gen_t gen, uint64_t len, bufferlist &bl) {
+    hobject_t hoid = make_test_object(obj_name);
+    ghobject_t ghoid(hoid, gen, shard_id_t(0));
+    return store->read(chs.at(0), ghoid, 0, len, bl);
+  };
+
+  // Step 1: an object smaller than one chunk. Both the old size and the new
+  // size below are thus in chunk 0 of shard 0.
+  const size_t initial_size = 128;
+  std::string initial_data(initial_size, 'X');
+
+  ASSERT_EQ(0, create_and_write(obj_name, initial_data));
+  verify_object(obj_name, initial_data, 0, initial_size);
+
+  bufferlist before;
+  ASSERT_EQ((int)initial_size, read_shard_0(ghobject_t::NO_GEN, initial_size, before))
+    << "could not read shard 0 before the op";
+
+  // Step 2: one op that shrinks the object to 64 bytes and writes over the
+  // range the truncate destroys.
+  const size_t new_size = 64;
+  ASSERT_EQ(0, truncate_and_write(
+    obj_name,
+    initial_size,
+    new_size,
+    {{0, std::string(new_size, 'Y')}}));
+
+  // Step 3: the rollback clone of this version must hold the object as it was
+  // before the op.
+  object_info_t oi = read_shard_object_info(obj_name, 0);
+  gen_t gen = oi.version.version;
+  ASSERT_NE(ghobject_t::NO_GEN, gen) << "no version for the rollback clone";
+
+  bufferlist clone;
+  int r = read_shard_0(gen, initial_size, clone);
+  ASSERT_GT(r, 0) << "the rollback clone of version " << gen << " is missing";
+
+  ASSERT_TRUE(clone.contents_equal(before))
+    << "the rollback clone does not hold the original object. "
+    << "appends_and_clone_ranges() cloned the range a second time, after "
+    << "truncate() had already truncated the source. "
+    << "See https://tracker.ceph.com/issues/79531";
+}
+
 // ---------------------------------------------------------------------------
 // Backend configurations and size parameters
 // ---------------------------------------------------------------------------
