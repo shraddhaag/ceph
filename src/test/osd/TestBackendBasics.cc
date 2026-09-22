@@ -840,7 +840,11 @@ TEST_P(TestBackendBasics, TruncateWithinChunkAndWriteRollbackClone) {
   std::string obj_name =
     "test_rollback_clone_" + backend_config.label + "_" + param.label;
 
-  // Reads shard 0 of the object, generation gen. NO_GEN is the object itself,
+  // A copy: ghobject_t::NO_GEN has no out of line definition, thus binding a
+  // reference to it, as gtest does, would not link.
+  const gen_t no_gen = ghobject_t::NO_GEN;
+
+  // Reads shard 0 of the object, generation gen. no_gen is the object itself,
   // any other generation is the rollback clone of that version.
   auto read_shard_0 = [&](gen_t gen, uint64_t len, bufferlist &bl) {
     hobject_t hoid = make_test_object(obj_name);
@@ -857,7 +861,7 @@ TEST_P(TestBackendBasics, TruncateWithinChunkAndWriteRollbackClone) {
   verify_object(obj_name, initial_data, 0, initial_size);
 
   bufferlist before;
-  ASSERT_EQ((int)initial_size, read_shard_0(ghobject_t::NO_GEN, initial_size, before))
+  ASSERT_EQ((int)initial_size, read_shard_0(no_gen, initial_size, before))
     << "could not read shard 0 before the op";
 
   // Step 2: one op that shrinks the object to 64 bytes and writes over the
@@ -873,7 +877,7 @@ TEST_P(TestBackendBasics, TruncateWithinChunkAndWriteRollbackClone) {
   // before the op.
   object_info_t oi = read_shard_object_info(obj_name, 0);
   gen_t gen = oi.version.version;
-  ASSERT_NE(ghobject_t::NO_GEN, gen) << "no version for the rollback clone";
+  ASSERT_NE(no_gen, gen) << "no version for the rollback clone";
 
   bufferlist clone;
   int r = read_shard_0(gen, initial_size, clone);
