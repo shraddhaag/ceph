@@ -416,6 +416,86 @@ TEST_P(
 
   std::cout << "\n=== RollbackAfterOSDFailure Test Complete ===" << std::endl;
 }
+
+/**
+ * Reproducer for https://tracker.ceph.com/issues/79531
+ *
+ * An EC op that shrinks an object and writes over the shrunk range clones the
+ * rollback object two times:
+ *
+ *   ECTransaction::Generate::truncate()                 clones, then truncates
+ *   ECTransaction::Generate::appends_and_clone_ranges() clones the same range
+ *                                                       again
+ *
+ * The second clone reads a source that the first one's truncate already
+ * changed, thus the rollback object holds the truncated object, not the
+ * original one. The guard in appends_and_clone_ranges() compares chunk
+ * aligned sizes, so a shrink that stays inside one chunk gets through it.
+ *
+ * This test shows the result: it blocks the op, fails an OSD to roll the op
+ * back, then reads the object. The rollback must give the object the data it
+ * held before the op.
+ */
+TEST_P(
+  TestECFailoverWithPeering,
+  RollbackAfterTruncateWithinChunkAndWrite
+) {
+  const int failing_shard = k + m - 1;
+  const int blocked_shard = 1;
+  const std::string obj_name = "test_rollback_truncate_within_chunk";
+
+  // The object is smaller than one chunk, thus the shrink below stays inside
+  // chunk 0 of shard 0. A chunk aligned shrink does not hit the defect.
+  const size_t initial_size = 128;
+  const size_t new_size = 64;
+  const std::string pattern_a(initial_size, 'A');
+  const std::string pattern_b(new_size, 'B');
+
+  ASSERT_TRUE(all_shards_active()) << "Initial peering must complete";
+
+  create_and_write_verify(obj_name, pattern_a);
+
+  // Stop the ops from completing.
+  suspend_primary_to_osd(blocked_shard);
+
+  // One op that shrinks the object and writes over the range the truncate
+  // destroys. This is the op that clones the rollback object two times.
+  int result = truncate_and_write(
+    obj_name,
+    initial_size,
+    new_size,
+    {{0, pattern_b}});
+  ASSERT_EQ(-EINPROGRESS, result);
+
+  // Fail a shard, thus the op above is rolled back.
+  mark_osd_down(failing_shard);
+  unsuspend_primary_to_osd(blocked_shard);
+  event_loop->run_until_idle();
+
+  ASSERT_TRUE(all_shards_active())
+    << "All shards should be active after peering";
+
+  bufferlist actual;
+  int r = read_object(obj_name, 0, initial_size, actual, initial_size);
+  ASSERT_GE(r, 0) << "could not read the object after the rollback";
+  std::string got(actual.c_str(), actual.length());
+
+  // What the defect gives: the object as the truncate left it, ie the first
+  // 64 bytes of the original data and 64 zero bytes.
+  std::string truncated(new_size, 'A');
+  truncated.append(initial_size - new_size, '\0');
+
+  if (got == truncated) {
+    FAIL() << "the rollback restored the truncated object, not the original "
+              "one: appends_and_clone_ranges() cloned the range a second "
+              "time, after truncate() had already truncated the source. "
+              "See https://tracker.ceph.com/issues/79531";
+  }
+
+  ASSERT_EQ(pattern_a, got)
+    << "the object did not go back to its content before the op. If it holds "
+       "the new data, no rollback occurred and the test setup is wrong.";
+}
 /**
  * ECRecoveryTest - Test EC recovery scenario with missing objects
  *
