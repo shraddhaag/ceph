@@ -12,6 +12,8 @@ overrides:
       osd:
         crimson osd obc lru size: 10
         debug ms: 20
+        # Temporary: debug https://tracker.ceph.com/issues/80205
+        debug osd: 20
         seastore cachepin size pershard: 64M
         seastore max concurrent transactions: 8
       client:
