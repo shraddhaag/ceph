@@ -174,6 +174,14 @@ LogManager::omap_set_keys(
 	    log_root.hint, log_root.type);
 	}
 	if (cur->is_initial_pending()) {
+	  // An initial_pending LogNode is appended to and never overwritten
+	  // (see expect_overflow() above). If an earlier write in this
+	  // transaction left _fastinfo at its end, that entry would stay live
+	  // next to the new one, and the node could never be removed once its
+	  // log entries are trimmed. Drop it; the new _fastinfo follows.
+	  if (is_log_key(p.first) && cur->get_size() > 0 && cur->can_ow()) {
+	    cur->remove_entry(get_ow_key());
+	  }
 	  cur->append_kv(t, p.first, p.second);
 	} else {
 	  auto mut = tm.get_mutable_extent(t, cur)->cast<LogNode>();
