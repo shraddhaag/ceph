@@ -9,6 +9,7 @@
 #include "crimson/os/seastore/transaction_manager.h"
 #include "crimson/os/seastore/segment_manager.h"
 #include "crimson/os/seastore/omap_manager.h"
+#include "crimson/os/seastore/omap_manager/log/log_manager.h"
 
 #include "test/crimson/seastore/test_block.h"
 
@@ -954,6 +955,231 @@ TEST_P(omap_manager_test_t, monotonic_inc)
       submit_transaction(std::move(t));
     }
     check_mappings(omap_root);
+  });
+}
+
+namespace {
+
+struct log_chain_stat_t {
+  size_t nodes = 0;
+  size_t live = 0;
+  // live keys of each node, newest node first
+  std::vector<std::vector<std::string>> live_keys;
+};
+
+std::ostream &operator<<(std::ostream &out, const log_chain_stat_t &s) {
+  out << s.nodes << " nodes, " << s.live << " live entries";
+  return out;
+}
+
+} // anonymous namespace
+
+/*
+ * Drive a LOG omap the way PGLog drives the pgmeta object, and check that the
+ * LogNode chains stay bounded once the log and the dup list are at their
+ * steady-state sizes.
+ *
+ * Each write sets the new log entry and _fastinfo (_info on a write that
+ * trims, since the trim moves log_tail, which pg_fast_info_t does not carry;
+ * the older _fastinfo is not removed). Once the log is osd_pg_log_trim_min
+ * (100) entries over its target length, the oldest entries are trimmed; a
+ * trimmed entry becomes a dup only if it is within the newest
+ * osd_pg_log_dups_tracked versions, and the dup list is then cut back to that
+ * many entries, oldest first (PGLog::IndexedLog::trim). As in
+ * PGLog::_write_log_and_missing, the removed keys go in one omap_rm_keys call
+ * before the omap_set_keys call, in the same transaction.
+ *
+ * The cases cover two regimes of target vs dups_tracked:
+ *  - target >= dups_tracked: no dups at all (crimson with few PGs per
+ *    reactor, e.g. 128 PGs: target 10000);
+ *  - target <= dups_tracked - trim_min: every trimmed entry becomes a dup,
+ *    so every dup trim batch is contiguous.
+ * In between, each trim keeps only some of the trimmed entries as dups and
+ * the dup trim batches are non-contiguous; that path is not covered here.
+ *
+ * Writes that do not trim are also run several to a transaction, as SeaStore
+ * merges the queued transactions of a collection.
+ */
+TEST_P(omap_manager_test_t, log_manager_pglog_steady_state)
+{
+  run_async([this] {
+    using namespace crimson::os::seastore::log_manager;
+    constexpr uint64_t TRIM_MIN = 100;
+    constexpr uint64_t TRIMS = 100;
+    constexpr epoch_t epoch = 11;
+    // node count may differ by a few nodes depending on where the newest
+    // nodes happen to be cut
+    constexpr size_t SLACK = 4;
+
+    auto log_key = [=](uint64_t v) {
+      return fmt::format("{:010}.{:020}", epoch, v);
+    };
+    auto dup_key = [&](uint64_t v) {
+      return "dup_" + log_key(v);
+    };
+    auto read_node = [&](Transaction &t, laddr_t addr) {
+      return with_trans_intr(t, [&](auto &t) {
+	return tm->read_extent<LogNode>(t, addr, LOG_NODE_BLOCK_SIZE);
+      }).unsafe_get().extent;
+    };
+    auto walk = [&](Transaction &t, laddr_t addr) {
+      log_chain_stat_t s;
+      while (addr != L_ADDR_NULL) {
+	auto node = read_node(t, addr);
+	std::vector<std::string> keys;
+	auto bitmap = node->get_cur_bitmap();
+	uint32_t index = 0;
+	for (auto it = node->iter_begin(); it != node->iter_end(); ++it, ++index) {
+	  if (!bitmap.is_set(index)) {
+	    keys.push_back(it->get_key());
+	  }
+	}
+	s.nodes++;
+	s.live += keys.size();
+	s.live_keys.push_back(std::move(keys));
+	addr = node->get_prev_addr();
+      }
+      return s;
+    };
+    auto dump = [](const char *name, const log_chain_stat_t &s) {
+      std::ostringstream out;
+      out << name << ": " << s << "\n";
+      for (size_t i = 0; i < s.live_keys.size(); ++i) {
+	auto &keys = s.live_keys[i];
+	out << "  node " << i << ": " << keys.size() << " live";
+	for (size_t j = 0; j < keys.size() && j < 4; ++j) {
+	  out << " " << keys[j];
+	}
+	out << (keys.size() > 4 ? " ..." : "") << "\n";
+      }
+      return out.str();
+    };
+
+    auto run_case = [&](const char *name, uint64_t dups_tracked,
+			uint64_t target, size_t batch) {
+      SCOPED_TRACE(name);
+      LogManager lm(*tm);
+      omap_root_t root;
+      {
+	auto t = create_mutate_transaction();
+	root = with_trans_intr(*t, [&](auto &t) {
+	  return lm.initialize_omap(
+	    t, laddr_hint_t::create_global_md_hint(), omap_type_t::LOG);
+	}).unsafe_get();
+	submit_transaction(std::move(t));
+      }
+
+      std::deque<uint64_t> log, dups;
+      uint64_t head = 0;
+      bool info_written = false;
+      // SeaStore merges queued transactions of a collection into one
+      // (SeaStore::Shard::build_next_batch), except those with omap removals
+      // (txn_is_batchable). So up to `batch` consecutive writes without a
+      // trim share one transaction, and a write that trims runs alone.
+      TransactionRef pending;
+      size_t in_batch = 0;
+      auto flush = [&] {
+	if (pending) {
+	  submit_transaction(std::move(pending));
+	  pending = nullptr;
+	  in_batch = 0;
+	}
+      };
+      auto write = [&] {
+	++head;
+	std::map<std::string, bufferlist> kvs;
+	kvs[log_key(head)] = rand_buffer(240);
+	log.push_back(head);
+
+	std::set<std::string> rm;
+	bool trim = log.size() >= target + TRIM_MIN;
+	if (trim) {
+	  kvs["_info"] = rand_buffer(720);
+	  info_written = true;
+	  auto n = log.size() - target;
+	  for (size_t i = 0; i < n; ++i) {
+	    auto e = log.front();
+	    log.pop_front();
+	    rm.insert(log_key(e));
+	    if (e + dups_tracked > head) {
+	      dups.push_back(e);
+	      kvs[dup_key(e)] = rand_buffer(64);
+	    }
+	  }
+	  while (dups.size() > dups_tracked) {
+	    rm.insert(dup_key(dups.front()));
+	    dups.pop_front();
+	  }
+
+	  flush();
+	  auto t = create_mutate_transaction();
+	  with_trans_intr(*t, [&](auto &t) {
+	    return lm.omap_rm_keys(root, t, rm).si_then([&] {
+	      return lm.omap_set_keys(root, t, kvs);
+	    });
+	  }).unsafe_get();
+	  submit_transaction(std::move(t));
+	} else {
+	  kvs[get_ow_key()] = rand_buffer(160);
+	  if (!pending) {
+	    pending = create_mutate_transaction();
+	  }
+	  with_trans_intr(*pending, [&](auto &t) {
+	    return lm.omap_set_keys(root, t, kvs);
+	  }).unsafe_get();
+	  if (++in_batch == batch) {
+	    flush();
+	  }
+	}
+      };
+      auto stats = [&] {
+	flush();
+	auto t = create_read_transaction();
+	auto log_chain = walk(*t, root.addr);
+	auto tail = read_node(*t, root.addr);
+	auto dup_chain = walk(*t, tail->get_dup_tail_addr());
+	return std::make_pair(log_chain, dup_chain);
+      };
+
+      // reach the steady state: the log at its target length, the dup list
+      // full (if this case makes dups), and a few trims beyond that
+      bool makes_dups = target < dups_tracked;
+      while ((makes_dups && dups.size() < dups_tracked) ||
+	     head < 3 * (target + TRIM_MIN)) {
+	write();
+      }
+      auto [log1, dup1] = stats();
+      logger().info("{}: steady state: log chain {} nodes / {} live, "
+		    "dup chain {} nodes / {} live",
+		    name, log1.nodes, log1.live, dup1.nodes, dup1.live);
+
+      for (uint64_t i = 0; i < TRIMS * TRIM_MIN; ++i) {
+	write();
+      }
+      auto [log2, dup2] = stats();
+      logger().info("{}: after {} trims: log chain {} nodes / {} live, "
+		    "dup chain {} nodes / {} live",
+		    name, TRIMS, log2.nodes, log2.live, dup2.nodes, dup2.live);
+
+      // every live entry is a key the model still has (+ _fastinfo, + _info)
+      EXPECT_EQ(log2.live, log.size() + 1 + (info_written ? 1 : 0))
+	<< dump("log chain", log2);
+      EXPECT_EQ(dup2.live, dups.size()) << dump("dup chain", dup2);
+      // and the chains do not grow
+      EXPECT_LE(log2.nodes, log1.nodes + SLACK)
+	<< dump("log chain before", log1) << dump("log chain after", log2);
+      EXPECT_LE(dup2.nodes, dup1.nodes + SLACK)
+	<< dump("dup chain before", dup1) << dump("dup chain after", dup2);
+    };
+
+    run_case("no dups, small", 300, 400, 1);
+    run_case("no dups, full size", 3000, 10000, 1);
+    run_case("contiguous dups, small", 300, 150, 1);
+    run_case("contiguous dups, full size", 3000, 2800, 1);
+    // several writes per transaction, as SeaStore batches them
+    run_case("no dups, full size, 4 writes per transaction", 3000, 10000, 4);
+    run_case("contiguous dups, full size, 4 writes per transaction",
+	     3000, 2800, 4);
   });
 }
 
