@@ -14,9 +14,9 @@ void delta_t::replay(LogKVNodeLayout &l) {
     l._append(key, val);
     return;
   } else if (op == op_t::ADD_PREV) {
-    l.set_prev_node(prev);
+    l.set_prev_node(addr);
   } else if (op == op_t::ADD_DUP_ADDR) {
-    l.set_dup_head(prev);
+    l.set_dup_head(addr);
   } else if (op == op_t::INIT) {
     l.set_last_pos(0); 
     l.set_size(0);

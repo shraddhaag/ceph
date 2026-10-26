@@ -32,14 +32,15 @@ struct delta_t {
   } op;
   std::string key;
   ceph::bufferlist val;
-  laddr_t prev;
+  // the prev address for ADD_PREV, the dup head address for ADD_DUP_ADDR
+  laddr_t addr;
 
   DENC(delta_t, v, p) {
     DENC_START(1, 1, p);
     denc(v.op, p);
     denc(v.key, p);
     denc(v.val, p);
-    denc(v.prev, p);
+    denc(v.addr, p);
     DENC_FINISH(p);
   }
 
@@ -129,7 +130,7 @@ public:
     std::optional<laddr_t> l = std::nullopt;
     for (auto it = buffer.rbegin(); it != buffer.rend(); ++it) {
       if (it->op == delta_t::op_t::ADD_DUP_ADDR) {
-        l = it->prev;
+        l = it->addr;
 	return l;
       }
     }
@@ -140,7 +141,7 @@ public:
     std::optional<laddr_t> l = std::nullopt;
     for (auto it = buffer.rbegin(); it != buffer.rend(); ++it) {
       if (it->op == delta_t::op_t::ADD_PREV) {
-        l = it->prev;
+        l = it->addr;
 	return l;
       }
 
