@@ -778,7 +778,7 @@ LogManager::remove_kvs(Transaction &t, laddr_t dst,
 
   if (is_log_key(*first)) {
     // skip to search due to out of range
-    if (l != std::nullopt && extent->log_has_larger_than(*last)) {
+    if (l != std::nullopt && extent->log_has_larger_than(*l)) {
       co_await remove_kvs(t, prev_addr, first, last, extent);
       co_return;
     }
