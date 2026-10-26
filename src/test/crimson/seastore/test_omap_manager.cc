@@ -969,6 +969,8 @@ struct log_manager_fastinfo_test_t : omap_manager_test_t {
   // pg_fast_info_t
   static constexpr size_t LOG_VAL = 240;
   static constexpr size_t FASTINFO_VAL = 160;
+  // about the size of a pg_log_dup_t
+  static constexpr size_t DUP_VAL = 100;
 
   std::optional<log_manager::LogManager> lm;
   uint64_t head = 0;
@@ -1086,6 +1088,51 @@ struct log_manager_fastinfo_test_t : omap_manager_test_t {
       addr = read_node(*t, addr)->get_prev_addr();
     }
     return n;
+  }
+
+  // the LogNodes of the list that starts at the newest LogNode addr
+  std::vector<laddr_t> list_nodes(Transaction &t, laddr_t addr) {
+    std::vector<laddr_t> addrs;
+    while (addr != L_ADDR_NULL) {
+      addrs.push_back(addr);
+      addr = read_node(t, addr)->get_prev_addr();
+    }
+    return addrs;
+  }
+
+  laddr_t dup_list(omap_root_t &root) {
+    auto t = create_read_transaction();
+    return read_node(*t, root.addr)->get_dup_tail_addr();
+  }
+
+  size_t dup_list_length(omap_root_t &root) {
+    auto t = create_read_transaction();
+    return list_nodes(*t, dup_list(root)).size();
+  }
+
+  void write_dup(omap_root_t &root, uint64_t v) {
+    std::map<std::string, bufferlist> kvs;
+    kvs[fmt::format("dup_{:010}.{:020}", epoch, v)] = rand_buffer(DUP_VAL);
+    auto t = create_mutate_transaction();
+    with_trans_intr(*t, [&](auto &t) {
+      return get_lm().omap_set_keys(root, t, kvs);
+    }).unsafe_get();
+    submit_transaction(std::move(t));
+  }
+
+  bool has_mapping(laddr_t addr) {
+    auto t = create_read_transaction();
+    using ertr = with_trans_ertr<TransactionManager::get_pin_iertr>;
+    return with_trans_intr(*t, [&](auto &t) {
+      return tm->get_pin(t, addr);
+    }).safe_then([](auto) {
+      return ertr::make_ready_future<bool>(true);
+    }).handle_error(
+      [](const crimson::ct_error::enoent &) {
+	return seastar::make_ready_future<bool>(false);
+      },
+      crimson::ct_error::assert_all("unexpected error in get_pin")
+    ).get();
   }
 
   // a log value that is too large to go over the _fastinfo at the end of
@@ -1247,6 +1294,41 @@ TEST_P(log_manager_fastinfo_test_t, entry_larger_than_node_trim)
     trim(root, 1, head);
     check_one_live_fastinfo(root);
     EXPECT_EQ(chain_length(root), 1u);
+  });
+}
+
+// omap_clear() must free every LogNode of the log list and of the dup list,
+// not only the newest LogNode of each list
+TEST_P(log_manager_fastinfo_test_t, clear_frees_all_nodes)
+{
+  run_async([this] {
+    auto root = init_root();
+    for (int i = 0; chain_length(root) < 3; ++i) {
+      ASSERT_LT(i, 10000);
+      write_one(root, LOG_VAL);
+    }
+    for (uint64_t v = 1; dup_list_length(root) < 3; ++v) {
+      ASSERT_LT(v, 10000u);
+      write_dup(root, v);
+    }
+    std::vector<laddr_t> addrs;
+    {
+      auto t = create_read_transaction();
+      addrs = list_nodes(*t, root.addr);
+      auto dups = list_nodes(*t, dup_list(root));
+      addrs.insert(addrs.end(), dups.begin(), dups.end());
+    }
+    ASSERT_GE(addrs.size(), 6u);
+    auto t = create_mutate_transaction();
+    with_trans_intr(*t, [&](auto &t) {
+      return get_lm().omap_clear(root, t);
+    }).unsafe_get();
+    submit_transaction(std::move(t));
+    EXPECT_EQ(root.get_location(), L_ADDR_NULL);
+    replay_log();
+    for (auto addr : addrs) {
+      EXPECT_FALSE(has_mapping(addr)) << "LogNode " << addr << " was not freed";
+    }
   });
 }
 

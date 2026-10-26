@@ -942,28 +942,34 @@ LogManager::omap_rm_key_range(
 }
 
 LogManager::omap_clear_ret
+LogManager::remove_list(Transaction &t, laddr_t addr)
+{
+  LOG_PREFIX(LogManager::remove_list);
+  while (addr != L_ADDR_NULL) {
+    auto extent = co_await log_load_extent<LogNode>(
+      t, addr, BEGIN_KEY, END_KEY);
+    assert(extent);
+    DEBUGT("remove {}", t, *extent);
+    laddr_t prev_addr = extent->get_prev_addr();
+    co_await tm.remove(t, addr
+    ).handle_error_interruptible(
+      omap_clear_iertr::pass_further{},
+      crimson::ct_error::assert_all("Invalid error in remove_list")
+    );
+    addr = prev_addr;
+  }
+  co_return;
+}
+
+LogManager::omap_clear_ret
 LogManager::omap_clear(omap_root_t &root, Transaction &t)
 {
   LOG_PREFIX(LogManager::omap_clear);
   DEBUGT("enter", t);
   assert(root.get_type() == omap_type_t::LOG);
-  co_await remove_kvs(t, root.addr,
-    std::optional<std::string>(),
-    std::optional<std::string>(std::nullopt), nullptr);
-  co_await remove_kvs(t, 
-    co_await get_dup_addr_from_root(t, root.addr),
-    std::optional<std::string>(),
-    std::optional<std::string>(std::nullopt), nullptr);
-  co_await tm.remove(t, co_await get_dup_addr_from_root(t, root.addr)
-  ).handle_error_interruptible(
-    omap_clear_iertr::pass_further{},
-    crimson::ct_error::assert_all("Invalid error in omap_clear")
-  );
-  co_await tm.remove(t, root.get_location()
-  ).handle_error_interruptible(
-    omap_clear_iertr::pass_further{},
-    crimson::ct_error::assert_all("Invalid error in omap_clear")
-  );
+  laddr_t dup_addr = co_await get_dup_addr_from_root(t, root.addr);
+  co_await remove_list(t, root.get_location());
+  co_await remove_list(t, dup_addr);
   root.update(
     L_ADDR_NULL,
     0,

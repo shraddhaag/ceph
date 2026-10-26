@@ -388,6 +388,17 @@ public:
     LogNodeRef mut,
     LogNodeRef prev);
 
+  /**
+   * remove_list
+   *
+   * Removes every LogNode of a list, starting at the newest LogNode
+   * @addr and following the prev addresses to the oldest one.
+   *
+   * @param t     Transaction context.
+   * @param addr  Logical address of the newest LogNode of the list.
+   */
+  omap_clear_ret remove_list(Transaction &t, laddr_t addr);
+
   base_iertr::future<laddr_t> get_dup_addr_from_root(Transaction &t, laddr_t addr);
 
   /**
