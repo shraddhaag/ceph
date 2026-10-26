@@ -426,6 +426,7 @@ std::ostream &LogNode::print_detail_l(std::ostream &out) const
 {
   laddr_t l = this->get_prev_addr();
   out << ", prev=" << l
+      << ", dup_head=" << this->get_dup_head_addr()
       << ", num=" << this->get_size()
       << ", used_space=" << this->use_space()
       << ", capacity=" << this->get_capacity()
